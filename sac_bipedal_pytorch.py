@@ -255,18 +255,18 @@ class Agent:
             target_param.data.copy_(param.data)
 
     def load_weights(self):
-        self.value_net.load_state_dict(torch.load('/test/My Drive/RL_Bipedal_SAC/value_net.pth'))        
-        self.soft_q_net1.load_state_dict(torch.load('/test/My Drive/RL_Bipedal_SAC/soft_q_net1.pth'))
-        self.soft_q_net2.load_state_dict(torch.load('/test/My Drive/RL_Bipedal_SAC/soft_q_net2.pth'))        
-        self.policy_net.load_state_dict(torch.load('/test/My Drive/RL_Bipedal_SAC/policy_net.pth'))
-        self.target_value_net.load_state_dict(torch.load('/test/My Drive/RL_Bipedal_SAC/target_value_net.pth'))
+        self.value_net.load_state_dict(torch.load('/test/Your Path/value_net.pth'))        
+        self.soft_q_net1.load_state_dict(torch.load('/test/Your Path/soft_q_net1.pth'))
+        self.soft_q_net2.load_state_dict(torch.load('/test/Your Path/soft_q_net2.pth'))        
+        self.policy_net.load_state_dict(torch.load('/test/Your Path/policy_net.pth'))
+        self.target_value_net.load_state_dict(torch.load('/test/Your Path/target_value_net.pth'))
 
     def save_weights(self):
-        torch.save(self.value_net.state_dict(), '/test/My Drive/RL_Bipedal_SAC/value_net.pth')
-        torch.save(self.soft_q_net1.state_dict(), '/test/My Drive/RL_Bipedal_SAC/soft_q_net1.pth')
-        torch.save(self.soft_q_net2.state_dict(), '/test/My Drive/RL_Bipedal_SAC/soft_q_net2.pth')
-        torch.save(self.policy_net.state_dict(), '/test/My Drive/RL_Bipedal_SAC/policy_net.pth')
-        torch.save(self.target_value_net.state_dict(), '/test/My Drive/RL_Bipedal_SAC/target_value_net.pth')
+        torch.save(self.value_net.state_dict(), '/test/Your Path/value_net.pth')
+        torch.save(self.soft_q_net1.state_dict(), '/test/Your Path/soft_q_net1.pth')
+        torch.save(self.soft_q_net2.state_dict(), '/test/Your Path/soft_q_net2.pth')
+        torch.save(self.policy_net.state_dict(), '/test/Your Path/policy_net.pth')
+        torch.save(self.target_value_net.state_dict(), '/test/Your Path/target_value_net.pth')
 
 def plot(datas):
     print('----------')
@@ -335,13 +335,13 @@ def run_init_explore(env, agent, render, max_init_explore):
     
 def main():
     ############## Hyperparameters ##############
-    using_google_drive = True # If you using Google Colab and want to save the agent to your GDrive, set this to True
+    using_google_drive = False # If you using Google Colab and want to save the agent to your GDrive, set this to True
     load_weights = False # If you want to load the agent, set this to True
-    save_weights = True # If you want to save the agent, set this to True
+    save_weights = False # If you want to save the agent, set this to True
     training_mode = True # If you want to train the agent, set this to True. But set this otherwise if you only want to test it
     reward_threshold = None # Set threshold for reward. The learning will stop if reward has pass threshold. Set none to sei this off
     
-    render = False # If you want to display the image. Turn this off if you run this in Google Collab
+    render = True # If you want to display the image. Turn this off if you run this in Google Collab
     n_update = 1 # How many episode before you update the Policy
     n_plot_batch = 100 # How many episode you want to plot the result
     n_episode = 1000 # How many episode you want to run
