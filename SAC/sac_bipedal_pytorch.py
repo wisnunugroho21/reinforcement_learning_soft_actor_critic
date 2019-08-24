@@ -336,9 +336,9 @@ def run_init_explore(env, agent, render, max_init_explore):
 def main():
     ############## Hyperparameters ##############
     using_google_drive = False # If you using Google Colab and want to save the agent to your GDrive, set this to True
-    load_weights = False # If you want to load the agent, set this to True
+    load_weights = True # If you want to load the agent, set this to True
     save_weights = False # If you want to save the agent, set this to True
-    training_mode = True # If you want to train the agent, set this to True. But set this otherwise if you only want to test it
+    training_mode = False # If you want to train the agent, set this to True. But set this otherwise if you only want to test it
     reward_threshold = None # Set threshold for reward. The learning will stop if reward has pass threshold. Set none to sei this off
     
     render = True # If you want to display the image. Turn this off if you run this in Google Collab
