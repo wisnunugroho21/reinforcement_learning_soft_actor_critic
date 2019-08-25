@@ -26,8 +26,8 @@ git clone https://github.com/wisnunugroho21/reinforcement_learning_soft_actor_cr
 After you clone the project, enter the folder and run following script in cmd/terminal :
 
 ```
-cd reinforcement_learning_ppo_rnd/PPO_RND
-python ppo_rnd_cartpole_pytorch.py
+cd reinforcement_learning_ppo_rnd/SAC
+python sac_bipedal_pytorch.py
 ```
 
 ## Soft Actor Critic
