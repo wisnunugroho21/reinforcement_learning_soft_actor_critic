@@ -36,6 +36,8 @@ Soft Actor Critic (SAC) is an algorithm which optimizes a stochastic policy in a
 
 A central feature of SAC is entropy regularization. The policy is trained to maximize a trade-off between expected return and entropy, a measure of randomness in the policy. This has a close connection to the exploration-exploitation trade-off: increasing entropy results in more exploration, which can accelerate learning later on. It can also prevent the policy from prematurely converging to a bad local optimum.
 
+You can find full detail on [here](https://spinningup.openai.com/en/latest/algorithms/sac.html) and [here](https://towardsdatascience.com/soft-actor-critic-demystified-b8427df61665)
+
 ## Future development
 
 I really want to adapt this code to Tensorflow  
