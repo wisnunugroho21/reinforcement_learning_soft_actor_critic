@@ -49,5 +49,5 @@ This project is far from finish. Any fix, contribute, or an idea is very appreci
 
 ## Source
 
-These codes was borrowed from [this blog](https://towardsdatascience.com/soft-actor-critic-demystified-b8427df61665)
+These codes was borrowed from [this blog](https://towardsdatascience.com/soft-actor-critic-demystified-b8427df61665)  
 I refactor the code in order to easier to use in other project and easier to understand the concept
