@@ -1,442 +1,585 @@
-import math
-import random
-
-import gym
-import numpy as np
-
 import torch
 import torch.nn as nn
-import torch.optim as optim
-import torch.nn.functional as F
+import numpy as np
+import copy
+import time
+import datetime
+import gym
+from torch.utils.data import Dataset
 from torch.distributions import Normal
+from torch.distributions.kl import kl_divergence
+from torch.utils.data import DataLoader
 
-import matplotlib.pyplot as plt
+def set_device(use_gpu = True):
+    if use_gpu:
+        if torch.cuda.is_available():
+            return torch.device('cuda:0')
+        else:
+            return torch.device('cpu')
+    else:
+        return torch.device('cpu')
 
-use_cuda = torch.cuda.is_available()
-device   = torch.device("cuda" if use_cuda else "cpu")
+def to_numpy(datas, use_gpu = True):
+    if use_gpu:
+        if torch.cuda.is_available():
+            return datas.detach().cpu().numpy()
+        else:
+            return datas.detach().numpy()
+    else:
+        return datas.detach().numpy()
 
-class ReplayBuffer:
-    def __init__(self, capacity):
-        self.capacity = capacity
-        self.buffer = []
-        self.position = 0
+def to_tensor(datas, use_gpu = True, first_unsqueeze = False, last_unsqueeze = False, detach = False):
+    if isinstance(datas, tuple):
+        datas = list(datas)
+        for i, data in enumerate(datas):
+            data    = torch.FloatTensor(data).to(set_device(use_gpu))
+            if first_unsqueeze: 
+                data    = data.unsqueeze(0)
+            if last_unsqueeze:
+                data    = data.unsqueeze(-1) if data.shape[-1] != 1 else data
+            if detach:
+                data    = data.detach()
+            datas[i] = data
+        datas = tuple(datas)
+
+    elif isinstance(datas, list):
+        for i, data in enumerate(datas):
+            data    = torch.FloatTensor(data).to(set_device(use_gpu))
+            if first_unsqueeze: 
+                data    = data.unsqueeze(0)
+            if last_unsqueeze:
+                data    = data.unsqueeze(-1) if data.shape[-1] != 1 else data
+            if detach:
+                data    = data.detach()
+            datas[i] = data
+        datas = tuple(datas)
+
+    else:
+        datas   = torch.FloatTensor(datas).to(set_device(use_gpu))
+        if first_unsqueeze: 
+            datas   = datas.unsqueeze(0)
+        if last_unsqueeze:
+            datas   = datas.unsqueeze(-1) if datas.shape[-1] != 1 else datas
+        if detach:
+            datas   = datas.detach()
     
-    def push(self, state, action, reward, next_state, done):
-        if len(self.buffer) < self.capacity:
-            self.buffer.append(None)
-        self.buffer[self.position] = (state, action, reward, next_state, done)
-        self.position = (self.position + 1) % self.capacity
-    
-    def sample(self, batch_size):
-        batch = random.sample(self.buffer, batch_size)
-        state, action, reward, next_state, done = map(np.stack, zip(*batch))
-        return state, action, reward, next_state, done
-    
+    return datas
+
+def copy_parameters(source_model, target_model, tau = 0.95):
+    for target_param, param in zip(target_model.parameters(), source_model.parameters()):
+        target_param.data.copy_(target_param.data * tau + param.data * (1.0 - tau))
+
+    return target_model
+
+class Policy_Model(nn.Module):
+    def __init__(self, state_dim, action_dim, use_gpu = True):
+        super(Policy_Model, self).__init__()
+
+        self.nn_layer = nn.Sequential(
+          nn.Linear(state_dim, 128),
+          nn.ReLU(),
+          nn.Linear(128, 64),
+          nn.ReLU(),
+        ).float().to(set_device(use_gpu))
+
+        self.actor_layer = nn.Sequential(
+          nn.Linear(32, action_dim),
+          nn.Tanh()
+        ).float().to(set_device(use_gpu))
+
+        self.actor_std_layer = nn.Sequential(
+          nn.Linear(32, action_dim),
+          nn.Sigmoid()
+        ).float().to(set_device(use_gpu))
+        
+    def forward(self, states, detach = False):
+      x = self.nn_layer(states)
+
+      if detach:
+        return (self.actor_layer(x[:, :32]).detach(), self.actor_std_layer(x[:, 32:64]).detach())
+      else:
+        return (self.actor_layer(x[:, :32]), self.actor_std_layer(x[:, 32:64]))
+      
+class Q_Model(nn.Module):
+    def __init__(self, state_dim, action_dim, use_gpu = True):
+        super(Q_Model, self).__init__()   
+
+        self.nn_layer = nn.Sequential(
+          nn.Linear(state_dim + action_dim, 128),
+          nn.ReLU(),
+          nn.Linear(128, 32),
+          nn.ReLU(),
+          nn.Linear(32, 1)
+        ).float().to(set_device(use_gpu))
+        
+    def forward(self, states, actions, detach = False):
+      x   = torch.cat((states, actions), -1)
+
+      if detach:
+        return self.nn_layer(x).detach()
+      else:
+        return self.nn_layer(x)
+
+class PolicyMemory(Dataset):
+    def __init__(self, capacity = 100000, datas = None):
+        self.capacity       = capacity
+        self.position       = 0
+
+        if datas is None:
+            self.states         = []
+            self.actions        = []
+            self.rewards        = []
+            self.dones          = []
+            self.next_states    = []
+        else:
+            self.states, self.actions, self.rewards, self.dones, self.next_states = datas
+            if len(self.dones) >= self.capacity:
+                raise Exception('datas cannot be longer than capacity')        
+
     def __len__(self):
-        return len(self.buffer)
+        return len(self.dones)
 
-class NormalizedEnv(gym.ActionWrapper):
-    def _action(self, action):
-        low  = self.action_space.low
-        high = self.action_space.high
+    def __getitem__(self, idx):
+        return torch.FloatTensor(self.states[idx]), torch.FloatTensor(self.actions[idx]), torch.FloatTensor([self.rewards[idx]]), \
+            torch.FloatTensor([self.dones[idx]]), torch.FloatTensor(self.next_states[idx])
+
+    def save_eps(self, state, action, reward, done, next_state):
+        if len(self) >= self.capacity:
+            del self.states[0]
+            del self.actions[0]
+            del self.rewards[0]
+            del self.dones[0]
+            del self.next_states[0]
+
+        self.states.append(state)
+        self.actions.append(action)
+        self.rewards.append(reward)
+        self.dones.append(done)
+        self.next_states.append(next_state)
+
+    def save_replace_all(self, states, actions, rewards, dones, next_states):
+        self.clear_memory()
+        self.save_all(states, actions, rewards, dones, next_states)
+
+    def save_all(self, states, actions, rewards, dones, next_states):
+        for state, action, reward, done, next_state in zip(states, actions, rewards, dones, next_states):
+            self.save_eps(state, action, reward, done, next_state)
+
+    def get_all_items(self):         
+        return self.states, self.actions, self.rewards, self.dones, self.next_states 
+
+    def clear_memory(self):
+        del self.states[:]
+        del self.actions[:]
+        del self.rewards[:]
+        del self.dones[:]
+        del self.next_states[:]
+
+class BasicContinous():
+    def __init__(self, use_gpu):
+        self.use_gpu = use_gpu
+
+    def sample(self, datas):
+        mean, std = datas
+
+        distribution    = Normal(torch.zeros_like(mean), torch.ones_like(std))
+        rand            = distribution.sample().float().to(set_device(self.use_gpu))
+        return (mean + std.squeeze() * rand).squeeze(0)
         
-        action = low + (action + 1.0) * 0.5 * (high - low)
-        action = np.clip(action, low, high)
+    def entropy(self, datas):
+        mean, std = datas
         
-        return action
-
-    def _reverse_action(self, action):
-        low  = self.action_space.low
-        high = self.action_space.high
+        distribution = Normal(mean, std)
+        return distribution.entropy().float().to(set_device(self.use_gpu))
         
-        action = 2 * (action - low) / (high - low) - 1
-        action = np.clip(action, low, high)
+    def logprob(self, datas, value_data):
+        mean, std = datas
+
+        distribution = Normal(mean, std)
+        # return distribution.log_prob(value_data).float().to(set_device(self.use_gpu))
+
+        bounded_value_data = torch.tanh(value_data)
+        return distribution.log_prob(value_data) - torch.log(1 - bounded_value_data.pow(2) + 1e-6)
+
+    def kldivergence(self, datas1, datas2):
+        mean1, std1 = datas1
+        mean2, std2 = datas2
+
+        distribution1 = Normal(mean1, std1)
+        distribution2 = Normal(mean2, std2)
+        return kl_divergence(distribution1, distribution2).float().to(set_device(self.use_gpu))
+
+    def deterministic(self, datas):
+        mean, _ = datas
+        return mean.squeeze(0)
+
+class PolicyLoss():
+    def __init__(self, distribution):
+        self.distribution       = distribution
+
+    def compute_loss(self, action_datas, actions, predicted_q_value1, predicted_q_value2):
+        log_prob                = self.distribution.logprob(action_datas, actions)
+        policy_loss             = (torch.min(predicted_q_value1, predicted_q_value2) - 0.2 * log_prob).mean()
+        return policy_loss * -1
+
+class QLoss():
+    def __init__(self, distribution, gamma = 0.99):
+        self.gamma          = gamma
+        self.distribution   = distribution
+
+    def compute_loss(self, predicted_q_value1, predicted_q_value2, target_q_value1, target_q_value2, next_action_datas, next_actions, reward, done):
+        next_log_prob           = self.distribution.logprob(next_action_datas, next_actions)
+        next_value              = (torch.min(target_q_value1, target_q_value2) - 0.2 * next_log_prob).detach()
+
+        target_q_value          = (reward + (1 - done) * self.gamma * next_value).detach()
+
+        q_value_loss1           = ((target_q_value - predicted_q_value1).pow(2) * 0.5).mean()
+        q_value_loss2           = ((target_q_value - predicted_q_value2).pow(2) * 0.5).mean()
         
-        return actions
+        return q_value_loss1 + q_value_loss2
 
-class ValueNetwork(nn.Module):
-    def __init__(self, state_dim, hidden_dim):
-        super(ValueNetwork, self).__init__()
+class AgentSAC():
+    def __init__(self, soft_q1, soft_q2, policy, state_dim, action_dim, distribution, q_loss, policy_loss, memory, 
+        soft_q_optimizer, policy_optimizer, is_training_mode = True, batch_size = 32, epochs = 1, 
+        soft_tau = 0.95, folder = 'model', use_gpu = True):
 
-        self.value_layer = nn.Sequential(
-                nn.Linear(state_dim, hidden_dim),
-                nn.ReLU(),
-                nn.Linear(hidden_dim, hidden_dim),
-                nn.ReLU(),
-                nn.Linear(hidden_dim, 1)
-              ).float().to(device)
+        self.batch_size         = batch_size
+        self.is_training_mode   = is_training_mode
+        self.action_dim         = action_dim
+        self.state_dim          = state_dim
+        self.folder             = folder
+        self.use_gpu            = use_gpu
+        self.epochs             = epochs
+        self.soft_tau           = soft_tau
+
+        self.policy             = policy
+
+        self.soft_q1            = soft_q1
+        self.target_soft_q1     = copy.deepcopy(self.soft_q1)
+
+        self.soft_q2            = soft_q2
+        self.target_soft_q2     = copy.deepcopy(self.soft_q2)             
+
+        self.distribution       = distribution
+        self.memory             = memory
         
-    def forward(self, state):
-        return self.value_layer(state)  
+        self.qLoss              = q_loss
+        self.policyLoss         = policy_loss
 
-    def init_weights(self, m):
-        for name, param in m.named_parameters():
-            if 'bias' in name:
-                nn.init.constant_(param, 0.01)
-            elif 'weight' in name:
-                nn.init.kaiming_uniform_(param)
-
-    def lets_init_weights(self):      
-        self.value_layer.apply(self.init_weights)
+        self.device             = set_device(self.use_gpu)
+        self.i_update           = 0
         
-class SoftQNetwork(nn.Module):
-    def __init__(self, num_inputs, num_actions, hidden_dim):
-        super(SoftQNetwork, self).__init__()
+        self.soft_q_optimizer   = soft_q_optimizer
+        self.policy_optimizer   = policy_optimizer
 
-        self.softQ_layer = nn.Sequential(
-                nn.Linear(num_inputs  + num_actions, hidden_dim),
-                nn.ReLU(),
-                nn.Linear(hidden_dim, hidden_dim),
-                nn.ReLU(),
-                nn.Linear(hidden_dim, 1)
-              ).float().to(device)
-        
-    def forward(self, state, action):
-        x = torch.cat([state, action], 1)
-        return self.softQ_layer(x) 
+        self.soft_q_scaler      = torch.cuda.amp.GradScaler()
+        self.policy_scaler      = torch.cuda.amp.GradScaler()        
 
-    def init_weights(self, m):
-        for name, param in m.named_parameters():
-            if 'bias' in name:
-                nn.init.constant_(param, 0.01)
-            elif 'weight' in name:
-                nn.init.kaiming_uniform_(param)
+    def _training_q(self, states, actions, rewards, dones, next_states):
+        self.soft_q_optimizer.zero_grad()
+        with torch.cuda.amp.autocast():
+            next_action_datas   = self.policy(next_states, True)
+            next_actions        = self.distribution.sample(next_action_datas).detach()
 
-    def lets_init_weights(self):      
-        self.softQ_layer.apply(self.init_weights)
-        
-class PolicyNetwork(nn.Module):
-    def __init__(self, num_inputs, num_actions, hidden_dim, log_std_min=-20, log_std_max=2):
-        super(PolicyNetwork, self).__init__()
+            target_q_value1     = self.target_soft_q1(next_states, torch.tanh(next_actions), True)
+            target_q_value2     = self.target_soft_q2(next_states, torch.tanh(next_actions), True)
 
-        self.policy_layer = nn.Sequential(
-                nn.Linear(num_inputs, hidden_dim),
-                nn.ReLU(),
-                nn.Linear(hidden_dim, hidden_dim),
-                nn.ReLU()
-              ).float().to(device)
+            predicted_q_value1  = self.soft_q1(states, actions)
+            predicted_q_value2  = self.soft_q2(states, actions)
 
-        self.mean_linear = nn.Linear(hidden_dim, num_actions)        
-        self.log_std_linear = nn.Linear(hidden_dim, num_actions)
-        
-        self.log_std_min = log_std_min
-        self.log_std_max = log_std_max
-        
-    def forward(self, state):
-        x = self.policy_layer(state)
-        
-        mean    = self.mean_linear(x)
-        log_std = self.log_std_linear(x)
-        log_std = torch.clamp(log_std, self.log_std_min, self.log_std_max)
-        
-        return mean, log_std
+            loss  = self.qLoss.compute_loss(predicted_q_value1, predicted_q_value2, target_q_value1, target_q_value2, next_action_datas, next_actions, rewards, dones)
 
-    def init_weights(self, m):
-        for name, param in m.named_parameters():
-            if 'bias' in name:
-                nn.init.constant_(param, 0.01)
-            elif 'weight' in name:
-                nn.init.kaiming_uniform_(param)
+        self.soft_q_scaler.scale(loss).backward()
+        self.soft_q_scaler.step(self.soft_q_optimizer)
+        self.soft_q_scaler.update()
 
-    def lets_init_weights(self):      
-        self.policy_layer.apply(self.init_weights)
+    def _training_policy(self, states):
+        self.policy_optimizer.zero_grad()
+        with torch.cuda.amp.autocast():
+            action_datas        = self.policy(states)
+            actions             = self.distribution.sample(action_datas)
 
-class Agent:
-    def __init__(self, state_dim, action_dim, hidden_dim = 256, replay_buffer_size = 1000000, batch_size = 128, epsilon = 1e-6, learning_rate = 3e-4):
-        self.gamma    = 0.99
-        self.soft_tau = 0.001
-        self.epochs = 1
-        self.replay_buffer = ReplayBuffer(replay_buffer_size)
-        self.batch_size = batch_size
-        self.epsilon = epsilon        
+            predicted_q_value1  = self.soft_q1(states, torch.tanh(actions))
+            predicted_q_value2  = self.soft_q2(states, torch.tanh(actions))
 
-        self.value_net         = ValueNetwork(state_dim, hidden_dim).to(device)
-        self.target_value_net  = ValueNetwork(state_dim, hidden_dim).to(device)
-        self.soft_q_net1       = SoftQNetwork(state_dim, action_dim, hidden_dim).to(device)
-        self.soft_q_net2       = SoftQNetwork(state_dim, action_dim, hidden_dim).to(device)
-        self.policy_net        = PolicyNetwork(state_dim, action_dim, hidden_dim).to(device)
+            loss = self.policyLoss.compute_loss(action_datas, actions, predicted_q_value1, predicted_q_value2)
 
-        self.value_optimizer   = optim.Adam(self.value_net.parameters(), lr = learning_rate)
-        self.soft_q_optimizer1 = optim.Adam(self.soft_q_net1.parameters(), lr = learning_rate)
-        self.soft_q_optimizer2 = optim.Adam(self.soft_q_net2.parameters(), lr = learning_rate)
-        self.policy_optimizer = optim.Adam(self.policy_net.parameters(), lr = learning_rate)
+        self.policy_scaler.scale(loss).backward()
+        self.policy_scaler.step(self.policy_optimizer)
+        self.policy_scaler.update()
 
-        for target_param, param in zip(self.target_value_net.parameters(), self.value_net.parameters()):
-            target_param.data.copy_(param.data)
+    def _update_sac(self):
+        if len(self.memory) > self.batch_size:
+            for _ in range(self.epochs):
+                dataloader  = DataLoader(self.memory, self.batch_size, shuffle = True, num_workers = 2)
+                states, actions, rewards, dones, next_states = next(iter(dataloader))
 
-    def prepro(self, mean, log_std, epsilon): 
-        std = log_std.exp()
+                self._training_q(states.float().to(self.device), actions.float().to(self.device), rewards.float().to(self.device), 
+                    dones.float().to(self.device), next_states.float().to(self.device))
+                self._training_policy(states.float().to(self.device))
 
-        normal    = Normal(0, 1)
-        z         = normal.sample()
-        action    = torch.tanh(mean + std * z.to(device))
-        log_prob  = Normal(mean, std).log_prob(mean + std * z.to(device)) - torch.log(1 - action.pow(2) + epsilon)
-        return action, log_prob, z, mean, log_std
-
-    def act(self, state):
-        state = torch.FloatTensor(state).unsqueeze(0).to(device)
-        mean, log_std = self.policy_net(state)
-        std = log_std.exp()
-        
-        normal = Normal(0, 1)
-        z      = normal.sample().to(device)
-        action = torch.tanh(mean + std*z)
-        
-        action  = action.cpu()
-        return action[0]
-
-    def get_Q_loss(self, reward, done, target_value, predicted_q_value):
-        target_q_value = reward + (1 - done) * self.gamma * target_value
-        q_value_loss = (predicted_q_value - target_q_value.detach()).pow(2).mean()
-        return q_value_loss
-
-    def get_V_loss(self, predicted_new_q_value1, predicted_new_q_value2, log_prob, predicted_value):
-        predicted_new_q_value = torch.min(predicted_new_q_value1, predicted_new_q_value2)
-        target_value_func = predicted_new_q_value - log_prob
-        value_loss = (predicted_value - target_value_func.detach()).pow(2).mean()
-        return value_loss
-
-    def get_policy_loss(self, predicted_new_q_value1, predicted_q_value2, log_prob):
-        predicted_new_q_value = torch.min(predicted_new_q_value1, predicted_q_value2)
-        policy_loss = (log_prob - predicted_new_q_value).mean()
-        return policy_loss
+            self.target_soft_q1 = copy_parameters(self.soft_q1, self.target_soft_q1, self.soft_tau)
+            self.target_soft_q2 = copy_parameters(self.soft_q2, self.target_soft_q2, self.soft_tau)
 
     def update(self):
-        for i in range(self.epochs):
-            state, action, reward, next_state, done = self.replay_buffer.sample(self.batch_size)
+        self._update_sac()
 
-            state      = torch.FloatTensor(state).to(device)
-            next_state = torch.FloatTensor(next_state).to(device)
-            action     = torch.FloatTensor(action).to(device)
-            reward     = torch.FloatTensor(reward).unsqueeze(1).to(device)
-            done       = torch.FloatTensor(np.float32(done)).unsqueeze(1).to(device)
-
-            predicted_q_value1  = self.soft_q_net1(state, action)
-            predicted_q_value2  = self.soft_q_net2(state, action)
-            predicted_value     = self.value_net(state)
-            mean, log_std       = self.policy_net(state)
-
-            target_value            = self.target_value_net(next_state)
-            new_action, log_prob, _, mean, log_std = self.prepro(mean, log_std, self.epsilon)
-            predicted_new_q_value1  = self.soft_q_net1(state, new_action)
-            predicted_new_q_value2  = self.soft_q_net2(state, new_action)        
-
-            q_value_loss1 = self.get_Q_loss(reward, done, target_value, predicted_q_value1)
-            q_value_loss2 = self.get_Q_loss(reward, done, target_value, predicted_q_value2)
-            value_loss    = self.get_V_loss(predicted_new_q_value1, predicted_new_q_value2, log_prob, predicted_value)
-            policy_loss   = self.get_policy_loss(predicted_new_q_value1, predicted_new_q_value2, log_prob)
-
-            self.soft_q_optimizer1.zero_grad()
-            q_value_loss1.backward()
-            self.soft_q_optimizer1.step()
-
-            self.soft_q_optimizer2.zero_grad()
-            q_value_loss2.backward()
-            self.soft_q_optimizer2.step()
-
-            self.value_optimizer.zero_grad()
-            value_loss.backward()
-            self.value_optimizer.step()
-
-            self.policy_optimizer.zero_grad()
-            policy_loss.backward()
-            self.policy_optimizer.step()
-
-            for target_param, param in zip(self.target_value_net.parameters(), self.value_net.parameters()):
-                target_param.data.copy_(target_param.data * (1.0 - self.soft_tau) + param.data * self.soft_tau)
-
-    def lets_init_weights(self):
-        self.value_net.lets_init_weights()
-        self.soft_q_net1.lets_init_weights()
-        self.soft_q_net2.lets_init_weights()
-        self.policy_net.lets_init_weights()
-
-        for target_param, param in zip(self.target_value_net.parameters(), self.value_net.parameters()):
-            target_param.data.copy_(param.data)
-
-    def load_weights(self):
-        self.value_net.load_state_dict(torch.load('/test/Your Path/value_net.pth'))        
-        self.soft_q_net1.load_state_dict(torch.load('/test/Your Path/soft_q_net1.pth'))
-        self.soft_q_net2.load_state_dict(torch.load('/test/Your Path/soft_q_net2.pth'))        
-        self.policy_net.load_state_dict(torch.load('/test/Your Path/policy_net.pth'))
-        self.target_value_net.load_state_dict(torch.load('/test/Your Path/target_value_net.pth'))
+    def save_memory(self, policy_memory):
+        states, actions, rewards, dones, next_states = policy_memory.get_all_items()
+        self.memory.save_all(states, actions, rewards, dones, next_states)
+        
+    def act(self, state):
+        state               = torch.FloatTensor(state).unsqueeze(0).to(self.device)
+        action_datas        = self.policy(state)
+        
+        if self.is_training_mode:
+            action = self.distribution.sample(action_datas)
+        else:
+            action = self.distribution.act_deterministic(action_datas)
+              
+        action = torch.tanh(action)
+        return to_numpy(action, self.use_gpu)    
 
     def save_weights(self):
-        torch.save(self.value_net.state_dict(), '/test/Your Path/value_net.pth')
-        torch.save(self.soft_q_net1.state_dict(), '/test/Your Path/soft_q_net1.pth')
-        torch.save(self.soft_q_net2.state_dict(), '/test/Your Path/soft_q_net2.pth')
-        torch.save(self.policy_net.state_dict(), '/test/Your Path/policy_net.pth')
-        torch.save(self.target_value_net.state_dict(), '/test/Your Path/target_value_net.pth')
-
-def plot(datas):
-    print('----------')
-    
-    plt.plot(datas)
-    plt.plot()
-    plt.xlabel('Episode')
-    plt.ylabel('Datas')
-    plt.show()
-    
-    print('Max :', np.max(datas))
-    print('Min :', np.min(datas))
-    print('Avg :', np.mean(datas))
-
-def run_episode(env, agent, state_dim, render, training_mode):
-    ############################################
-    state = env.reset()
-    done = False
-    total_reward = 0
-    t = 0
-    ############################################
-    
-    while not done:      
-        action = agent.act(state).detach()
-        next_state, reward, done, _ = env.step(action.numpy())
-          
-        total_reward += reward 
-        reward *= 10
+        torch.save({
+            'policy_state_dict': self.policy.state_dict(),
+            'soft_q1_state_dict': self.soft_q1.state_dict(),
+            'soft_q2_state_dict': self.soft_q2.state_dict(),
+            'policy_optimizer_state_dict': self.policy_optimizer.state_dict(),
+            'soft_q_optimizer_state_dict': self.soft_q_optimizer.state_dict(),
+            'policy_scaler_state_dict': self.policy_scaler.state_dict(),
+            'soft_q_scaler_state_dict': self.soft_q_scaler.state_dict(),
+        }, self.folder + '/sac.tar')
         
-        if training_mode:
-            agent.replay_buffer.push(state, action, reward, next_state, done) 
-            if len(agent.replay_buffer) > agent.batch_size:
-                agent.update()
+    def load_weights(self, device = None):
+        if device == None:
+            device = self.device
+
+        model_checkpoint = torch.load(self.folder + '/cql.tar', map_location = device)
+        
+        self.policy.load_state_dict(model_checkpoint['policy_state_dict'])
+        self.soft_q1.load_state_dict(model_checkpoint['soft_q1_state_dict'])
+        self.soft_q2.load_state_dict(model_checkpoint['soft_q2_state_dict'])
+        self.policy_optimizer.load_state_dict(model_checkpoint['policy_optimizer_state_dict'])
+        self.soft_q_optimizer.load_state_dict(model_checkpoint['soft_q_optimizer_state_dict'])
+        self.policy_scaler.load_state_dict(model_checkpoint['policy_scaler_state_dict'])
+        self.soft_q_scaler.load_state_dict(model_checkpoint['soft_q_scaler_state_dict'])
+
+class SingleStepRunner():
+    def __init__(self, agent, env, memory, training_mode, render, is_discrete, max_action, writer = None, n_plot_batch = 100):
+        self.agent              = agent
+        self.env                = env
+        self.memories           = memory
+
+        self.render             = render
+        self.training_mode      = training_mode
+        self.max_action         = max_action
+        self.writer             = writer
+        self.n_plot_batch       = n_plot_batch
+        self.is_discrete        = is_discrete
+
+        self.t_updates          = 0
+        self.i_episode          = 0
+        self.total_reward       = 0
+        self.eps_time           = 0
+
+        self.states             = self.env.reset()
+
+    def run(self):
+        self.memories.clear_memory() 
+        action  = self.agent.act(self.states)
+
+        if self.is_discrete:
+            action = int(action)
+
+        if self.max_action is not None and not self.is_discrete:
+            action_gym  =  np.clip(action, -1.0, 1.0) * self.max_action
+            next_state, reward, done, _ = self.env.step(action_gym)
+        else:
+            next_state, reward, done, _ = self.env.step(action)
+        
+        if self.training_mode:
+            self.memories.save_eps(self.states.tolist(), action, reward, float(done), next_state.tolist())
             
-        state = next_state
-        t += 1              
+        self.states         = next_state
+        self.eps_time       += 1 
+        self.total_reward   += reward
                 
-        if render:
-            env.render()
-        
-    return total_reward, t
+        if self.render:
+            self.env.render()
 
-def run_init_explore(env, agent, render, max_init_explore):
-    ############################################
-    state = env.reset()
-    done = False
-    ############################################
-    
-    for i in range(max_init_explore):    
-        action = env.action_space.sample()
-        next_state, reward, done, _ = env.step(action)
-          
-        agent.replay_buffer.push(state, action, reward, next_state, done) 
-        if len(agent.replay_buffer) > agent.batch_size:
-            agent.update()
-            
-        state = next_state 
-                
-        if render:
-            env.render()
+        if done:                
+            self.i_episode  += 1
+            print('Episode {} \t t_reward: {} \t time: {} '.format(self.i_episode, self.total_reward, self.eps_time))
 
-        if done:
-            state = env.reset()
-        
-    return agent
-    
-def main():
-    ############## Hyperparameters ##############
-    using_google_drive = False # If you using Google Colab and want to save the agent to your GDrive, set this to True
-    load_weights = True # If you want to load the agent, set this to True
-    save_weights = False # If you want to save the agent, set this to True
-    training_mode = False # If you want to train the agent, set this to True. But set this otherwise if you only want to test it
-    reward_threshold = None # Set threshold for reward. The learning will stop if reward has pass threshold. Set none to sei this off
-    
-    render = True # If you want to display the image. Turn this off if you run this in Google Collab
-    n_update = 1 # How many episode before you update the Policy
-    n_plot_batch = 100 # How many episode you want to plot the result
-    n_episode = 1000 # How many episode you want to run
-    max_init_explore = 200
-    #############################################         
-    env_name = "BipedalWalker-v2"
-    env = gym.make(env_name)
-    state_dim = env.observation_space.shape[0]
-    action_dim = env.action_space.shape[0]
-        
-    agent = Agent(state_dim, action_dim, hidden_dim = 512, batch_size = 256)  
-    ############################################# 
-    
-    if using_google_drive:
-        from google.colab import drive
-        drive.mount('/test')
-    
-    if load_weights:
-        agent.load_weights()
-        print('Weight Loaded')
-    else :
-        agent.lets_init_weights()
-        print('Init Weight')
-    
-    if torch.cuda.is_available() :
-        print('Using GPU')
-    
-    rewards = []   
-    batch_rewards = []
-    batch_solved_reward = []
-    
-    times = []
-    batch_times = []
+            if self.i_episode % self.n_plot_batch == 0 and self.writer is not None:
+                self.writer.add_scalar('Rewards', self.total_reward, self.i_episode)
+                self.writer.add_scalar('Times', self.eps_time, self.i_episode)
 
-    #############################################
+            self.states         = self.env.reset()
+            self.total_reward   = 0
+            self.eps_time       = 0        
 
-    if training_mode:
-        agent = run_init_explore(env, agent, render, max_init_explore)
+        return self.memories
 
-    #############################################    
-    
-    for i_episode in range(1, n_episode):
-        total_reward, time = run_episode(env, agent, state_dim, render, training_mode)
-        print('Episode {} \t t_reward: {} \t time: {} \t '.format(i_episode, total_reward, time))
-        batch_rewards.append(total_reward)
-        batch_times.append(time)       
-        
-        if training_mode:
-            # update after n episodes
-            if save_weights:
-                agent.save_weights()
-                print('Weights saved')
-                    
-        if reward_threshold:
-            if len(batch_solved_reward) == 100:            
-                if np.mean(batch_solved_reward) >= reward_threshold :              
-                    for reward in batch_times:
-                        rewards.append(reward)
+class Executor():
+    def __init__(self, agent, n_iteration, runner, save_weights = False, n_saved = 10, load_weights = False, is_training_mode = True):
+        self.agent              = agent
+        self.runner             = runner
 
-                    for time in batch_rewards:
-                        times.append(time)                    
+        self.n_iteration        = n_iteration
+        self.save_weights       = save_weights
+        self.n_saved            = n_saved
+        self.is_training_mode   = is_training_mode 
+        self.load_weights       = load_weights       
 
-                    print('You solved task after {} episode'.format(len(rewards)))
-                    break
+    def execute(self):
+        if self.load_weights:
+            self.agent.load_weights()
+            print('Weight Loaded')  
 
-                else:
-                    del batch_solved_reward[0]
-                    batch_solved_reward.append(total_reward)
+        start = time.time()
+        print('Running the training!!')
 
+        try:
+            for i_iteration in range(1, self.n_iteration, 1):
+                memories  = self.runner.run()
+                self.agent.save_memory(memories)
+
+                if self.is_training_mode:
+                    self.agent.update()
+
+                    if self.save_weights:
+                        if i_iteration % self.n_saved == 0:
+                            self.agent.save_weights()
+                            print('weights saved')
+
+        except KeyboardInterrupt:
+            print('Stopped by User')
+        finally:
+            finish = time.time()
+            timedelta = finish - start
+            print('\nTimelength: {}'.format(str( datetime.timedelta(seconds = timedelta) )))
+
+class GymWrapper():
+    def __init__(self, env):
+        self.env = env        
+
+    def is_discrete(self):
+        return type(self.env.action_space) is not gym.spaces.Box
+
+    def get_obs_dim(self):
+        if type(self.env.observation_space) is gym.spaces.Box:
+            state_dim = 1
+
+            if len(self.env.observation_space.shape) > 1:                
+                for i in range(len(self.env.observation_space.shape)):
+                    state_dim *= self.env.observation_space.shape[i]            
             else:
-                batch_solved_reward.append(total_reward)
-            
-        if i_episode % n_plot_batch == 0 and i_episode != 0:
-            # Plot the reward, times for every n_plot_batch
-            plot(batch_rewards)
-            plot(batch_times)
-            
-            for reward in batch_rewards:
-                rewards.append(reward)
-                
-            for time in batch_times:
-                times.append(time)
-                
-            batch_rewards = []
-            batch_times = []
+                state_dim = self.env.observation_space.shape[0]
 
-            print('========== Cummulative ==========')
-            # Plot the reward, times for every episode
-            plot(rewards)
-            plot(times)
+            return state_dim
+        else:
+            return self.env.observation_space.n
             
-    print('========== Final ==========')
-    # Plot the reward, times for every episode
-    plot(rewards)
-    plot(times) 
-            
-if __name__ == '__main__':
-    main()
+    def get_action_dim(self):
+        if self.is_discrete():
+            return self.env.action_space.n
+        else:
+            return self.env.action_space.shape[0]
+
+    def reset(self):
+        return self.env.reset()
+
+    def step(self, action):
+        return self.env.step(action)
+
+    def render(self):
+        self.env.render()
+
+    def close(self):
+        self.env.close()
+
+import random
+import os
+
+from torch.utils.tensorboard import SummaryWriter
+from torch.optim.adam import Adam
+
+############## Hyperparameters ##############
+
+load_weights            = False # If you want to load the agent, set this to True
+save_weights            = False # If you want to save the agent, set this to True
+is_training_mode        = True # If you want to train the agent, set this to True. But set this otherwise if you only want to test it
+use_gpu                 = True
+render                  = False # If you want to display the image. Turn this off if you run this in Google Collab
+reward_threshold        = 495 # Set threshold for reward. The learning will stop if reward has pass threshold. Set none to sei this off
+
+n_iteration             = 1000000
+n_plot_batch            = 1
+soft_tau                = 0.95
+n_saved                 = 1
+epochs                  = 1
+batch_size              = 32
+learning_rate           = 3e-4
+
+folder                  = 'weights/carla'
+env                     = gym.make('BipedalWalker-v3') # gym.make('BipedalWalker-v3') # gym.make('BipedalWalker-v3') for _ in range(2)] # CarlaEnv(im_height = 240, im_width = 240, im_preview = False, max_step = 512) # [gym.make(env_name) for _ in range(2)] # CarlaEnv(im_height = 240, im_width = 240, im_preview = False, seconds_per_episode = 3 * 60) # [gym.make(env_name) for _ in range(2)] # gym.make(env_name) # [gym.make(env_name) for _ in range(2)]
+
+state_dim           = None
+action_dim          = None
+max_action          = 1
+
+Policy_Model        = Policy_Model
+Q_Model             = Q_Model
+Policy_Dist         = BasicContinous
+Runner              = SingleStepRunner
+Executor            = Executor
+Policy_loss         = PolicyLoss
+Q_loss              = QLoss
+Wrapper             = GymWrapper
+Policy_Memory       = PolicyMemory
+Agent               = AgentSAC
+
+#####################################################################################################################################################
+
+random.seed(20)
+np.random.seed(20)
+torch.manual_seed(20)
+os.environ['PYTHONHASHSEED'] = str(20)
+
+environment = Wrapper(env)
+
+if state_dim is None:
+    state_dim = environment.get_obs_dim()
+print('state_dim: ', state_dim)
+
+if environment.is_discrete():
+    print('discrete')
+else:
+    print('continous')
+
+if action_dim is None:
+    action_dim = environment.get_action_dim()
+print('action_dim: ', action_dim)
+
+policy_dist         = Policy_Dist(use_gpu)
+sac_memory          = Policy_Memory()
+runner_memory       = Policy_Memory()
+q_loss              = Q_loss(policy_dist)
+policy_loss         = Policy_loss(policy_dist)
+
+policy              = Policy_Model(state_dim, action_dim, use_gpu).float().to(set_device(use_gpu))
+soft_q1             = Q_Model(state_dim, action_dim).float().to(set_device(use_gpu))
+soft_q2             = Q_Model(state_dim, action_dim).float().to(set_device(use_gpu))
+policy_optimizer    = Adam(list(policy.parameters()), lr = learning_rate)
+soft_q_optimizer    = Adam(list(soft_q1.parameters()) + list(soft_q2.parameters()), lr = learning_rate)
+
+agent = Agent(soft_q1, soft_q2, policy, state_dim, action_dim, policy_dist, q_loss, policy_loss, sac_memory, 
+        soft_q_optimizer, policy_optimizer, is_training_mode, batch_size, epochs, 
+        soft_tau, folder, use_gpu)
+                    
+runner      = Runner(agent, environment, runner_memory, is_training_mode, render, environment.is_discrete(), max_action, SummaryWriter(), n_plot_batch) # [Runner.remote(i_env, render, training_mode, n_update, Wrapper.is_discrete(), agent, max_action, None, n_plot_batch) for i_env in env]
+executor    = Executor(agent, n_iteration, runner, save_weights, n_saved, load_weights, is_training_mode)
+
+executor.execute()
